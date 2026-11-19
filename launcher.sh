@@ -885,6 +885,7 @@ NON_INTERACTIVE_CONFIG_KEYS=(
   ENABLE_PREFIX_CACHING
   KV_DISK_CACHE_DIR
   KV_DISK_CPU_BYTES
+  KV_DISK_MAX_BYTES
   ENABLE_YARN
   ENABLE_PROMPT_TOKENS_DETAILS
   DISABLE_PREFIX_CACHING
@@ -1378,6 +1379,7 @@ save_manager_state() {
     printf 'ENABLE_PREFIX_CACHING=%q\n' "${ENABLE_PREFIX_CACHING:-1}"
     printf 'KV_DISK_CACHE_DIR=%q\n' "${KV_DISK_CACHE_DIR:-}"
     printf 'KV_DISK_CPU_BYTES=%q\n' "${KV_DISK_CPU_BYTES:-}"
+    printf 'KV_DISK_MAX_BYTES=%q\n' "${KV_DISK_MAX_BYTES:-}"
     printf 'ENABLE_PROMPT_TOKENS_DETAILS=%q\n' "${ENABLE_PROMPT_TOKENS_DETAILS:-1}"
     printf 'MAX_MODEL_LEN=%q\n' "${MAX_MODEL_LEN:-}"
     printf 'GPU_UTIL=%q\n' "${GPU_UTIL:-}"
@@ -1745,14 +1747,38 @@ current_prefix_cache_label() {
   fi
 }
 
+kv_disk_max_bytes_is_valid() {
+  local value=${1:-}
+  local maximum=1125899906842624
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((${#value} < ${#maximum})) && return 0
+  ((${#value} > ${#maximum})) && return 1
+  [[ "$value" == "$maximum" || "$value" < "$maximum" ]]
+}
+
+format_kv_disk_max_gib() {
+  local bytes=${1:-0}
+  kv_disk_max_bytes_is_valid "$bytes" || bytes=64424509440
+  printf '%d.%02d' "$((bytes / 1073741824))" "$(((bytes % 1073741824) * 100 / 1073741824))"
+}
+
 validate_disk_kv_cache_config() {
   [[ -n "${KV_DISK_CACHE_DIR:-}" ]] || return 0
   if [[ "$KV_DISK_CACHE_DIR" != /* ]]; then
     echo "ERROR: KV_DISK_CACHE_DIR must be an absolute path." >&2
     return 1
   fi
+  if [[ "$KV_DISK_CACHE_DIR" == *$'\n'* || "$KV_DISK_CACHE_DIR" == *$'\r'* ]]; then
+    echo "ERROR: KV_DISK_CACHE_DIR cannot contain line breaks." >&2
+    return 1
+  fi
   if [[ ! "${KV_DISK_CPU_BYTES:-}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: KV_DISK_CPU_BYTES must be a positive byte count." >&2
+    return 1
+  fi
+  KV_DISK_MAX_BYTES=${KV_DISK_MAX_BYTES:-64424509440}
+  if ! kv_disk_max_bytes_is_valid "$KV_DISK_MAX_BYTES"; then
+    echo "ERROR: KV_DISK_MAX_BYTES must be a positive byte count no greater than 1 PiB." >&2
     return 1
   fi
   if [[ "${DISABLE_PREFIX_CACHING:-0}" == "1" || "${ENABLE_PREFIX_CACHING:-1}" != "1" ]]; then
@@ -1763,6 +1789,65 @@ validate_disk_kv_cache_config() {
     echo "ERROR: Disk KV cache requires PYTHONHASHSEED=0 across restarts." >&2
     return 1
   fi
+}
+
+configure_disk_kv_cache_pruner() {
+  if [[ -z "${KV_DISK_CACHE_DIR:-}" ]]; then
+    if [[ ! -f /etc/systemd/system/vllm-kv-cache-prune.timer ]]; then
+      return 0
+    fi
+    if [[ "$EUID" -ne 0 ]]; then
+      echo "ERROR: Disabling the existing Disk KV cache limit requires root." >&2
+      return 1
+    fi
+    systemctl disable --now vllm-kv-cache-prune.timer || return 1
+    systemctl stop vllm-kv-cache-prune.service || return 1
+    return 0
+  fi
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "ERROR: Configuring the Disk KV cache limit requires root." >&2
+    return 1
+  fi
+
+  local helper="$PROJECT_ROOT/tools/vllm-kv-cache-prune.py"
+  local unit_dir="$PROJECT_ROOT/tools/systemd"
+  if [[ ! -f "$helper" || ! -f "$unit_dir/vllm-kv-cache-prune.service" ||
+        ! -f "$unit_dir/vllm-kv-cache-prune.timer" ]]; then
+    echo "ERROR: Disk KV cache pruner files are missing from $PROJECT_ROOT/tools." >&2
+    return 1
+  fi
+
+  install -m 0755 "$helper" /usr/local/sbin/vllm-kv-cache-prune || return 1
+  install -m 0644 "$unit_dir/vllm-kv-cache-prune.service" \
+    /etc/systemd/system/vllm-kv-cache-prune.service || return 1
+  install -m 0644 "$unit_dir/vllm-kv-cache-prune.timer" \
+    /etc/systemd/system/vllm-kv-cache-prune.timer || return 1
+  mkdir -p /etc/default || return 1
+  local env_file=/etc/default/vllm-kv-cache-prune tmp_file
+  tmp_file=$(mktemp /etc/default/.vllm-kv-cache-prune.XXXXXX) || return 1
+  if ! python3 - "$tmp_file" "$KV_DISK_CACHE_DIR" "$KV_DISK_MAX_BYTES" <<'PY'
+import sys
+from pathlib import Path
+
+target, cache_dir, max_bytes = sys.argv[1:]
+if "\n" in cache_dir or "\r" in cache_dir:
+    raise SystemExit("KV_DISK_CACHE_DIR cannot contain line breaks")
+escaped_dir = cache_dir.replace("\\", "\\\\").replace('"', '\\"')
+Path(target).write_text(
+    f'KV_DISK_CACHE_DIR="{escaped_dir}"\nKV_DISK_MAX_BYTES={max_bytes}\n',
+    encoding="utf-8",
+)
+PY
+  then
+    rm -f -- "$tmp_file"
+    return 1
+  fi
+  chmod 0644 "$tmp_file" || { rm -f -- "$tmp_file"; return 1; }
+  mv -f -- "$tmp_file" "$env_file" || { rm -f -- "$tmp_file"; return 1; }
+
+  systemctl daemon-reload || return 1
+  systemctl enable --now vllm-kv-cache-prune.timer || return 1
+  systemctl start --no-block vllm-kv-cache-prune.service || return 1
 }
 
 disk_kv_transfer_config() {
@@ -3443,6 +3528,7 @@ edit_advanced_parameters() {
     ENABLE_PREFIX_CACHING=0
     KV_DISK_CACHE_DIR=""
     KV_DISK_CPU_BYTES=""
+    KV_DISK_MAX_BYTES=""
   fi
   CUSTOM_ALL_REDUCE_MODE=$(prompt_optional "Custom all-reduce mode (auto/off)" "${CUSTOM_ALL_REDUCE_MODE:-auto}") || return 0
   unset DISABLE_CUSTOM_ALL_REDUCE
@@ -3547,6 +3633,7 @@ edit_prefix_cache_menu() {
       ENABLE_PREFIX_CACHING=0
       KV_DISK_CACHE_DIR=""
       KV_DISK_CPU_BYTES=""
+      KV_DISK_MAX_BYTES=""
       ;;
     *)
       ENABLE_PREFIX_CACHING=1
@@ -3558,21 +3645,35 @@ edit_prefix_cache_menu() {
 }
 
 edit_disk_kv_cache_menu() {
-  local choice dir cpu_bytes
+  local choice dir cpu_bytes max_gib max_bytes current_max
   local current=disabled
   [[ -n "${KV_DISK_CACHE_DIR:-}" ]] && current=enabled
   choice=$(menu_select "Disk KV cache" "$current" disabled enabled) || return 0
   if [[ "$choice" == enabled ]]; then
     dir=$(prompt_default "SSD cache directory" "${KV_DISK_CACHE_DIR:-/mnt/nvme/vllm-kv-cache}") || return 0
     cpu_bytes=$(prompt_default "CPU staging bytes" "${KV_DISK_CPU_BYTES:-4294967296}") || return 0
-    if ! KV_DISK_CACHE_DIR=$dir KV_DISK_CPU_BYTES=$cpu_bytes validate_disk_kv_cache_config; then
+    current_max=${KV_DISK_MAX_BYTES:-64424509440}
+    if ! kv_disk_max_bytes_is_valid "$current_max"; then
+      current_max=64424509440
+    fi
+    max_gib=$((current_max / 1073741824))
+    (( max_gib > 0 )) || max_gib=1
+    max_gib=$(prompt_default "Disk KV cache limit (GiB)" "$max_gib") || return 0
+    if [[ ! "$max_gib" =~ ^[1-9][0-9]*$ ]] || (( ${#max_gib} > 7 )) || (( 10#$max_gib > 1048576 )); then
+      echo "ERROR: Disk KV cache limit must be 1 to 1048576 GiB." >&2
+      return 1
+    fi
+    max_bytes=$((10#$max_gib * 1073741824))
+    if ! KV_DISK_CACHE_DIR=$dir KV_DISK_CPU_BYTES=$cpu_bytes KV_DISK_MAX_BYTES=$max_bytes validate_disk_kv_cache_config; then
       return 1
     fi
     KV_DISK_CACHE_DIR=$dir
     KV_DISK_CPU_BYTES=$cpu_bytes
+    KV_DISK_MAX_BYTES=$max_bytes
   else
     KV_DISK_CACHE_DIR=""
     KV_DISK_CPU_BYTES=""
+    KV_DISK_MAX_BYTES=""
   fi
   save_manager_state
 }
@@ -3722,7 +3823,11 @@ runtime_parameter_menu() {
     reasoning_value=$(menu_value "$(current_reasoning_label)")
     tool_calling_value=$(menu_value "$(current_tool_calling_label)")
     prefix_cache_value=$(menu_value "$(current_prefix_cache_label)")
-    disk_kv_value=$(menu_value "${KV_DISK_CACHE_DIR:-disabled}")
+    if [[ -n "${KV_DISK_CACHE_DIR:-}" ]]; then
+      disk_kv_value=$(menu_value "${KV_DISK_CACHE_DIR} ($(format_kv_disk_max_gib "${KV_DISK_MAX_BYTES:-64424509440}") GiB limit)")
+    else
+      disk_kv_value=$(menu_value "disabled")
+    fi
 
     if is_tty; then
       clear >/dev/tty 2>/dev/null || true
@@ -6122,6 +6227,7 @@ Launch summary:
   Disk KV cache:        ${KV_DISK_CACHE_DIR:-disabled}
   Checkpoint fingerprint: $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "$DISK_KV_CHECKPOINT_FINGERPRINT" || printf 'n/a')
   CPU staging bytes:    $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "$KV_DISK_CPU_BYTES" || printf 'n/a')
+  Disk KV cache limit:  $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s GiB (%s bytes)' "$(format_kv_disk_max_gib "$KV_DISK_MAX_BYTES")" "$KV_DISK_MAX_BYTES" || printf 'n/a')
   Disk KV hash seed:    $([[ -n "${KV_DISK_CACHE_DIR:-}" ]] && printf '%s' "${PYTHONHASHSEED:-0}" || printf 'n/a')
   Custom all-reduce:    $(current_custom_all_reduce_label)
   Mamba cache mode:     ${MAMBA_CACHE_MODE:-auto}
@@ -6527,6 +6633,7 @@ run_start_flow() {
   if [[ "${PRINT_CONFIG:-0}" == "1" ]] || has_arg "--print-config" "$@"; then
     return 0
   fi
+  configure_disk_kv_cache_pruner || return 1
   launch_server
 }
 

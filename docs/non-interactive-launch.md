@@ -45,11 +45,16 @@ removed manually to reclaim space. Clear the cache after changing to an
 incompatible runtime. Disk caching requires local checkpoint directories;
 do not modify checkpoint files while the launcher starts or the service runs.
 
-The filesystem tier does not evict old files or enforce a disk quota. Use a
-dedicated volume with sufficient free space, monitor its usage, and clear stale
-cache data while the service is stopped. `KV_DISK_CPU_BYTES` limits only host
-RAM staging. The launcher fixes `PYTHONHASHSEED=0` when disk caching is enabled
-and rejects another value, so block hashes stay stable across restarts.
+The filesystem tier does not evict old files itself. The launcher adds an
+approximate disk limit by installing a systemd timer that checks every 15
+seconds and removes the oldest `.bin` blocks until usage is at or below 90% of
+`KV_DISK_MAX_BYTES`. Its default is 60 GiB. This is a periodic limit: usage may
+briefly exceed it between checks, and removal of a cache block causes it to be
+recomputed on a later miss. Disabling Disk KV in the launcher disables the
+timer; it leaves existing cache files in place. `KV_DISK_CPU_BYTES` limits
+only host RAM staging. The launcher fixes `PYTHONHASHSEED=0` when disk caching
+is enabled and rejects another value, so block hashes stay stable across
+restarts.
 
 ```bash
 ./launcher.sh \
@@ -57,6 +62,7 @@ and rejects another value, so block hashes stay stable across restarts.
   --gpu-devices 0,2,3,4 --tp-size 4 \
   --set KV_DISK_CACHE_DIR=/mnt/nvme/vllm-kv-cache \
   --set KV_DISK_CPU_BYTES=4294967296 \
+  --set KV_DISK_MAX_BYTES=64424509440 \
   --print-config
 ```
 

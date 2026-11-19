@@ -22,7 +22,13 @@ For usage feedback, feature requests, and community discussion, join the
 Current 0.2.x baseline: `v0.2.2-post3`
 Upstream baseline: `b23433088b` (`v0.29.1rc0-33`)
 
-Branch: [`main`](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/main)
+This public derivative is based on
+[`weicj/vLLM-2080Ti-Definitive`](https://github.com/weicj/vLLM-2080Ti-Definitive)
+at source commit
+[`93c9013e375b1ecbf2da88179d2a31175a0d5c99`](https://github.com/weicj/vLLM-2080Ti-Definitive/commit/93c9013e375b1ecbf2da88179d2a31175a0d5c99).
+See [FORK_NOTES.md](FORK_NOTES.md) for provenance and change scope.
+
+Branch: [`main`](https://github.com/jackzjh001/vllm-2080ti-definitive-disk-kv-cache/tree/main)
 Release reference: [v0.2.2-post3](https://github.com/weicj/vLLM-2080Ti-Definitive/releases/tag/v0.2.2-post3)
 Release history: [CHANGELOG.md](CHANGELOG.md)
 
@@ -114,6 +120,20 @@ settings, starts the service with health and smoke checks, and stops a running
 service.
 
 ![launcher.sh interactive main menu](docs/assets/launcher-main-menu.png)
+
+### Disk KV cache limit
+
+When disk KV caching is enabled, the launcher asks for a maximum size in GiB.
+At startup it installs and enables a systemd timer that scans the configured
+cache directory every 15 seconds. If the `.bin` block files exceed the limit,
+the cleaner removes the oldest files until usage falls to 90% of the limit.
+Evicted entries are cache data; vLLM recomputes them on a later miss. This is a
+periodic limit, so usage can briefly exceed the configured size between scans.
+
+The default limit is 60 GiB. Non-interactive launches can set
+`KV_DISK_MAX_BYTES` to a positive byte count up to 1 PiB. The launcher needs
+root access and systemd to install the timer. Disabling Disk KV disables the
+timer and leaves existing cache files in place.
 
 For automated deployment, pass the configuration non-interactively:
 

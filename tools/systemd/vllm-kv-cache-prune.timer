@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=Periodically enforce the vLLM disk KV cache limit
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=15s
+AccuracySec=1s
+Unit=vllm-kv-cache-prune.service
+
+[Install]
+WantedBy=timers.target

@@ -23,7 +23,7 @@ Profile 库是验证矩阵，不代表每个文件在每台机器上都能运行
 
 Launcher 可以启用 vLLM 内置的 `OffloadingConnector`，通过 CPU 暂存层和文件系统层将已完成的前缀 KV 块写入磁盘，不需要常驻的独立缓存进程。目录必须位于持久化存储上；重启后保持模型路径、KV 精度、块布局和并行配置一致。CPU 暂存空间占用主机内存，不会增加 GPU KV 容量。每次启动前，launcher 会读取目标模型和本地草稿模型的全部文件，按内容摘要选择独立的磁盘命名空间。因此在原路径替换权重后不会读到旧 KV；代价是启动时额外完整读取一次检查点。旧命名空间需要手动清理以回收空间。切换到不兼容的运行时仍需清理缓存。磁盘缓存要求检查点位于本地目录；launcher 启动和服务运行期间不要修改检查点文件。
 
-文件系统层不会自动淘汰旧文件，也没有磁盘配额；请使用空间充足的专用卷，监控用量，并在服务停止后清理过期缓存。`KV_DISK_CPU_BYTES` 只限制主机内存暂存空间。启用磁盘缓存时 launcher 固定 `PYTHONHASHSEED=0`，并拒绝其他值，以保证重启后的块哈希稳定。
+文件系统层本身不会淘汰旧文件。Launcher 会额外安装 systemd timer，每 15 秒检查一次，并在用量超过 `KV_DISK_MAX_BYTES` 时删除最早的 `.bin` 块，直到用量降至上限的 90% 或以下。默认上限为 60 GiB。这是定期执行的近似上限，检查间隔内用量可能短暂超出；被删除的缓存块会在之后未命中时重新计算。在 launcher 中关闭 Disk KV 会停用 timer，但保留已有缓存文件。`KV_DISK_CPU_BYTES` 只限制主机内存暂存空间。启用磁盘缓存时 launcher 固定 `PYTHONHASHSEED=0`，并拒绝其他值，以保证重启后的块哈希稳定。
 
 ```bash
 ./launcher.sh \
@@ -31,6 +31,7 @@ Launcher 可以启用 vLLM 内置的 `OffloadingConnector`，通过 CPU 暂存�
   --gpu-devices 0,2,3,4 --tp-size 4 \
   --set KV_DISK_CACHE_DIR=/mnt/nvme/vllm-kv-cache \
   --set KV_DISK_CPU_BYTES=4294967296 \
+  --set KV_DISK_MAX_BYTES=64424509440 \
   --print-config
 ```
 

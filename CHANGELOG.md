@@ -2,6 +2,16 @@
 
 This changelog tracks releases of vLLM 2080 Ti Definitive Edition separately from upstream vLLM releases.
 
+## Unreleased (public derivative)
+
+### Disk KV cache limit
+
+- Adds a GiB limit to the launcher's Disk KV cache settings.
+- Installs a systemd timer that periodically removes oldest filesystem KV block
+  files when the configured limit is exceeded, and disables the timer when Disk
+  KV is turned off in the launcher.
+- Records the exact source repository commit in `FORK_NOTES.md`.
+
 ## v0.2.2-post3 - 2026-10-01
 
 Patch release following `v0.2.2-post2`.

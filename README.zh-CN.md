@@ -20,7 +20,13 @@ profile 和验证资料。它基于上游 vLLM；再发布派生版本时必须�
 当前 0.2.x 基线：`v0.2.2-post3`
 上游基线：`b23433088b`（`v0.29.1rc0-33`）
 
-分支：[`main`](https://github.com/weicj/vLLM-2080Ti-Definitive/tree/main)
+本公开派生仓库基于
+[`weicj/vLLM-2080Ti-Definitive`](https://github.com/weicj/vLLM-2080Ti-Definitive)，
+源 commit 为
+[`93c9013e375b1ecbf2da88179d2a31175a0d5c99`](https://github.com/weicj/vLLM-2080Ti-Definitive/commit/93c9013e375b1ecbf2da88179d2a31175a0d5c99)。
+来源和修改范围见 [FORK_NOTES.md](FORK_NOTES.md)。
+
+分支：[`main`](https://github.com/jackzjh001/vllm-2080ti-definitive-disk-kv-cache/tree/main)
 版本参考：[v0.2.2-post3](https://github.com/weicj/vLLM-2080Ti-Definitive/releases/tag/v0.2.2-post3)
 版本记录：[CHANGELOG.md](CHANGELOG.md)
 
@@ -105,6 +111,17 @@ TP/PP 拓扑、选择启动模式与网络配置，并在启动时自动完成�
 也可以在菜单中停止已启动的服务。
 
 ![launcher.sh 交互式主菜单](docs/assets/launcher-main-menu.png)
+
+### Disk KV cache 上限
+
+启用 disk KV cache 时，launcher 会询问缓存目录、CPU staging 大小和磁盘缓存上限
+（GiB）。启动时会安装并启用 systemd timer，每 15 秒检查一次所配置的缓存目录。
+`.bin` block 文件超过上限时，清理器按最早写入时间删除缓存块，直到用量低于上限的
+90%。这些文件只是缓存；之后命中不到时 vLLM 会重新计算。由于采用定时检查，扫描
+间隔内用量可能短暂超过上限。
+
+默认上限为 60 GiB。非交互启动可通过 `KV_DISK_MAX_BYTES` 设置正数字节数，最高 1 PiB。
+安装 timer 需要 root 权限和 systemd。在 launcher 中关闭 Disk KV 会停用 timer，但保留已有缓存文件。
 
 自动化部署可使用非交互参数：
 
